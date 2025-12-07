@@ -40,7 +40,7 @@ go run main.go -d example.com
 ```
 
 ### Output Files
-The tool generates several output files in the current directory:
+The tool generates a unique directory for each target in `results/<domain>/`. The following files are saved there:
 -   `subfinder.txt` & `assets.txt`: Raw subdomain lists.
 -   `sub.txt`: Merged and deduplicated subdomain list.
 -   `live.txt`: List of live (reachable) subdomains.

@@ -133,13 +133,13 @@ func checkAndDownloadSecretFinder() {
 
 func printBanner() {
 	color.HiMagenta(`
-   ______      ____                      
-  / ____/___  / __ \___  _________  ____ 
- / / __/ __ \/ /_/ / _ \/ ___/ __ \/ __ \
-/ /_/ / /_/ / _, _/  __/ /__/ /_/ / / / /
-\____/\____/_/ |_|\___/\___/\____/_/ /_/ 
-                                         
-    v1.1 - Auto-Install & Recon Tool
+    ____  ____  ____                       
+   / __ )/ __ )/ __ \___  _________  ____  
+  / __  / __  / /_/ / _ \/ ___/ __ \/ __ \ 
+ / /_/ / /_/ / _, _/  __/ /__/ /_/ / / / / 
+/_____/_____/_/ |_|\___/\___/\____/_/ /_/  
+
+    Auto-Install & Recon Tool
     `)
 	fmt.Println()
 }
@@ -283,34 +283,42 @@ func main() {
 
 	target := *domainPtr
 
+	// Creates results directory: results/<target>
+	outputDir := filepath.Join("results", target)
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		errColor("[-] Error creating output directory: %v\n", err)
+		os.Exit(1)
+	}
+	success("[+] Results will be saved to: %s\n", outputDir)
+
 	// 1. Subdomain Discovery
-	runCommand("subfinder", []string{"-d", target, "-o", "subfinder.txt"}, "")
-	runCommand("assetfinder", []string{"--subs-only", target}, "assets.txt")
+	runCommand("subfinder", []string{"-d", target, "-o", filepath.Join(outputDir, "subfinder.txt")}, "")
+	runCommand("assetfinder", []string{"--subs-only", target}, filepath.Join(outputDir, "assets.txt"))
 
 	// 2. Merge & Deduplicate
-	mergeAndUnique([]string{"subfinder.txt", "assets.txt"}, "sub.txt")
+	mergeAndUnique([]string{filepath.Join(outputDir, "subfinder.txt"), filepath.Join(outputDir, "assets.txt")}, filepath.Join(outputDir, "sub.txt"))
 
 	// 3. Live Check (Probing)
-	runCommand("httpx-toolkit", []string{"-l", "sub.txt", "-o", "live.txt"}, "")
+	runCommand("httpx-toolkit", []string{"-l", filepath.Join(outputDir, "sub.txt"), "-o", filepath.Join(outputDir, "live.txt")}, "")
 
 	// 4. Detailed Scan
 	runCommand("httpx-toolkit", []string{
-		"-l", "sub.txt",
+		"-l", filepath.Join(outputDir, "sub.txt"),
 		"-title", "-sc", "-cl", "-location", "-fr",
-		"-o", "status.txt",
+		"-o", filepath.Join(outputDir, "status.txt"),
 	}, "")
 
 	// 5. Subdomain Takeover Check
-	runCommand("subzy", []string{"run", "--targets", "sub.txt"}, "")
+	runCommand("subzy", []string{"run", "--targets", filepath.Join(outputDir, "sub.txt")}, "")
 
 	// 6. Crawling (Katana)
-	runCommand("katana", []string{"-u", "live.txt", "-o", "katana.txt"}, "")
+	runCommand("katana", []string{"-u", filepath.Join(outputDir, "live.txt"), "-o", filepath.Join(outputDir, "katana.txt")}, "")
 
 	// 7. JS Extraction
-	extractJS("katana.txt", "jsfiles.txt")
+	extractJS(filepath.Join(outputDir, "katana.txt"), filepath.Join(outputDir, "jsfiles.txt"))
 
 	// 8. Secret Analysis
-	runSecretFinder("jsfiles.txt")
+	runSecretFinder(filepath.Join(outputDir, "jsfiles.txt"))
 
 	fmt.Println()
 	color.HiGreen("[!!!] All Recon Tasks Completed Successfully! [!!!]")
