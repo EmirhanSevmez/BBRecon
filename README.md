@@ -5,7 +5,6 @@
 ## 🚀 Features
 
 -   **Auto-Installation**: Automatically checks for and installs missing dependencies (Go tools) and downloads required scripts (e.g., `SecretFinder.py`).
--   **Smart Conflict Resolution**: Automatically manages `httpx` vs `httpx-toolkit` naming to avoid conflicts with Python libraries.
 -   **Subdomain Discovery**: Uses `subfinder` and `assetfinder` for comprehensive enumeration.
 -   **Live Host Probing**: Uses `httpx-toolkit` to filter for active subdomains.
 -   **Subdomain Takeover**: Checks for potential takeover vulnerabilities using `subzy`.
@@ -28,7 +27,7 @@ The tool will attempt to install the following Go binaries automatically if they
 ## 📥 Installation
 
 ```bash
-git clone https://github.com/yourusername/BBRecon.git
+git clone https://github.com/EmirhanSevmez/BBRecon.git
 cd BBRecon
 ```
 
