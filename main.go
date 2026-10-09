@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fatih/color"
@@ -23,12 +24,18 @@ var (
 	yellow   = color.New(color.FgYellow).PrintfFunc()
 )
 
+// printMu serializes colored console output across goroutines so parallel
+// recon steps don't interleave their log lines into garbage.
+var printMu sync.Mutex
+
 // --- Required Tools & Installation Paths ---
 var requiredTools = map[string]string{
 	"subfinder":   "github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",
 	"assetfinder": "github.com/tomnomnom/assetfinder@latest",
 	"subzy":       "github.com/PentestPad/subzy@latest",
 	"katana":      "github.com/projectdiscovery/katana/cmd/katana@latest",
+	"amass":       "github.com/owasp-amass/amass/v4/cmd/amass@master",
+	"dnsx":        "github.com/projectdiscovery/dnsx/cmd/dnsx@latest",
 }
 
 // --- Auto-Install Function ---
@@ -133,11 +140,11 @@ func checkAndDownloadSecretFinder() {
 
 func printBanner() {
 	color.HiMagenta(`
-    ____  ____  ____                       
-   / __ )/ __ )/ __ \___  _________  ____  
-  / __  / __  / /_/ / _ \/ ___/ __ \/ __ \ 
- / /_/ / /_/ / _, _/  __/ /__/ /_/ / / / / 
-/_____/_____/_/ |_|\___/\___/\____/_/ /_/  
+    ____  ____  ____
+   / __ )/ __ )/ __ \___  _________  ____
+  / __  / __  / /_/ / _ \/ ___/ __ \/ __ \
+ / /_/ / /_/ / _, _/  __/ /__/ /_/ / / / /
+/_____/_____/_/ |_|\___/\___/\____/_/ /_/
 
     Auto-Install & Recon Tool
     `)
@@ -147,14 +154,18 @@ func printBanner() {
 // --- Helper Functions ---
 
 func runCommand(toolName string, args []string, outputFile string) {
+	printMu.Lock()
 	info("[*] Running: %s...\n", toolName)
+	printMu.Unlock()
 
 	cmd := exec.Command(toolName, args...)
 
 	if outputFile != "" {
 		f, err := os.Create(outputFile)
 		if err != nil {
+			printMu.Lock()
 			errColor("[-] File creation error (%s): %v\n", toolName, err)
+			printMu.Unlock()
 			return
 		}
 		defer f.Close()
@@ -166,11 +177,30 @@ func runCommand(toolName string, args []string, outputFile string) {
 	cmd.Stderr = os.Stderr
 
 	err := cmd.Run()
+
+	printMu.Lock()
+	defer printMu.Unlock()
 	if err != nil {
 		errColor("[-] Error (%s): %v\n", toolName, err)
 	} else {
 		success("[+] %s completed.\n", toolName)
 	}
+}
+
+// runParallel fires every given task concurrently and waits for all of them
+// to finish. Used for the independent subdomain-enumeration tools, since
+// they don't depend on each other's output and running them sequentially
+// just wastes wall-clock time.
+func runParallel(tasks ...func()) {
+	var wg sync.WaitGroup
+	for _, t := range tasks {
+		wg.Add(1)
+		go func(fn func()) {
+			defer wg.Done()
+			fn()
+		}(t)
+	}
+	wg.Wait()
 }
 
 func mergeAndUnique(filenames []string, outputFilename string) {
@@ -206,6 +236,70 @@ func mergeAndUnique(filenames []string, outputFilename string) {
 	}
 
 	success("[+] Total Unique Subdomains: %d -> Saved to %s\n", counter, outputFilename)
+}
+
+// inScope reports whether a discovered host is actually within the tested
+// target: either the bare domain itself, or a proper subdomain of it
+// ("foo.example.com" qualifies for target "example.com", but
+// "notexample.com" or "example.com.evil.net" must not).
+func inScope(host, target string) bool {
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	target = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(target), "."))
+	return host == target || strings.HasSuffix(host, "."+target)
+}
+
+// filterScope splits a merged subdomain list into in-scope and out-of-scope
+// files. Recon tools like subfinder/amass sometimes pull in unrelated hosts
+// (shared CDN entries, lookalike domains, third-party infra) that must never
+// be probed, crawled, or scanned — especially against programs like a VDP
+// where testing anything outside the published scope is not authorized.
+// Everything downstream of this function only ever sees the in-scope file.
+func filterScope(inputFile, inScopeFile, outOfScopeFile, target string) int {
+	yellow("[!] Applying scope guard (target: %s)...\n", target)
+
+	in, err := os.Open(inputFile)
+	if err != nil {
+		errColor("[-] Scope guard: could not open %s: %v\n", inputFile, err)
+		return 0
+	}
+	defer in.Close()
+
+	inOut, err := os.Create(inScopeFile)
+	if err != nil {
+		errColor("[-] Scope guard: could not create %s: %v\n", inScopeFile, err)
+		return 0
+	}
+	defer inOut.Close()
+
+	outOut, err := os.Create(outOfScopeFile)
+	if err != nil {
+		errColor("[-] Scope guard: could not create %s: %v\n", outOfScopeFile, err)
+		return 0
+	}
+	defer outOut.Close()
+
+	inCount, outCount := 0, 0
+	scanner := bufio.NewScanner(in)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if inScope(line, target) {
+			inOut.WriteString(line + "\n")
+			inCount++
+		} else {
+			outOut.WriteString(line + "\n")
+			outCount++
+		}
+	}
+
+	success("[+] Scope guard: %d in-scope, %d out-of-scope (-> %s)\n", inCount, outCount, outOfScopeFile)
+	if outCount > 0 {
+		yellow("[!] %d out-of-scope host(s) were EXCLUDED from all further testing. Review %s before reporting any of them.\n", outCount, outOfScopeFile)
+	}
+
+	return inCount
 }
 
 func extractJS(inputFile string, outputFile string) {
@@ -291,34 +385,75 @@ func main() {
 	}
 	success("[+] Results will be saved to: %s\n", outputDir)
 
-	// 1. Subdomain Discovery
-	runCommand("subfinder", []string{"-d", target, "-o", filepath.Join(outputDir, "subfinder.txt")}, "")
-	runCommand("assetfinder", []string{"--subs-only", target}, filepath.Join(outputDir, "assets.txt"))
+	subfinderFile := filepath.Join(outputDir, "subfinder.txt")
+	assetsFile := filepath.Join(outputDir, "assets.txt")
+	amassFile := filepath.Join(outputDir, "amass.txt")
+	mergedFile := filepath.Join(outputDir, "sub_all.txt")
+	inScopeFile := filepath.Join(outputDir, "sub.txt")
+	outOfScopeFile := filepath.Join(outputDir, "out_of_scope.txt")
+	dnsxFile := filepath.Join(outputDir, "dnsx.txt")
+	liveFile := filepath.Join(outputDir, "live.txt")
+	statusFile := filepath.Join(outputDir, "status.txt")
+	katanaFile := filepath.Join(outputDir, "katana.txt")
+	jsFile := filepath.Join(outputDir, "jsfiles.txt")
 
-	// 2. Merge & Deduplicate
-	mergeAndUnique([]string{filepath.Join(outputDir, "subfinder.txt"), filepath.Join(outputDir, "assets.txt")}, filepath.Join(outputDir, "sub.txt"))
+	// 1. Subdomain Discovery — subfinder, assetfinder and amass are
+	// independent of each other, so run them concurrently instead of
+	// burning wall-clock time waiting on each one in turn.
+	// amass runs in -passive mode only: no active brute-forcing, which
+	// keeps traffic footprint low and appropriate for programs (like
+	// VDPs) that don't want aggressive scanning.
+	info("[*] Running subfinder, assetfinder and amass in parallel...\n")
+	runParallel(
+		func() {
+			runCommand("subfinder", []string{"-d", target, "-o", subfinderFile}, "")
+		},
+		func() {
+			runCommand("assetfinder", []string{"--subs-only", target}, assetsFile)
+		},
+		func() {
+			runCommand("amass", []string{"enum", "-passive", "-d", target, "-o", amassFile}, "")
+		},
+	)
 
-	// 3. Live Check (Probing)
-	runCommand("httpx-toolkit", []string{"-l", filepath.Join(outputDir, "sub.txt"), "-o", filepath.Join(outputDir, "live.txt")}, "")
+	// 2. Merge & Deduplicate (all three sources)
+	mergeAndUnique([]string{subfinderFile, assetsFile, amassFile}, mergedFile)
 
-	// 4. Detailed Scan
+	// 3. Scope Guard — drop anything that isn't actually target or a
+	// subdomain of target before any probing/crawling/scanning touches it.
+	inCount := filterScope(mergedFile, inScopeFile, outOfScopeFile, target)
+	if inCount == 0 {
+		errColor("[-] No in-scope hosts found after filtering. Stopping.\n")
+		os.Exit(1)
+	}
+
+	// 4. DNS resolution + wildcard detection on the in-scope set only.
+	// -wd flags the target so dnsx can filter out wildcard-DNS noise
+	// (large orgs are prone to this, and wildcard entries otherwise show
+	// up as a pile of "alive" subdomains that aren't real hosts).
+	runCommand("dnsx", []string{"-l", inScopeFile, "-wd", target, "-o", dnsxFile}, "")
+
+	// 5. Live Check (Probing) — in-scope only
+	runCommand("httpx-toolkit", []string{"-l", inScopeFile, "-o", liveFile}, "")
+
+	// 6. Detailed Scan — in-scope only
 	runCommand("httpx-toolkit", []string{
-		"-l", filepath.Join(outputDir, "sub.txt"),
+		"-l", inScopeFile,
 		"-title", "-sc", "-cl", "-location", "-fr",
-		"-o", filepath.Join(outputDir, "status.txt"),
+		"-o", statusFile,
 	}, "")
 
-	// 5. Subdomain Takeover Check
-	runCommand("subzy", []string{"run", "--targets", filepath.Join(outputDir, "sub.txt")}, "")
+	// 7. Subdomain Takeover Check — in-scope only
+	runCommand("subzy", []string{"run", "--targets", inScopeFile}, "")
 
-	// 6. Crawling (Katana)
-	runCommand("katana", []string{"-u", filepath.Join(outputDir, "live.txt"), "-o", filepath.Join(outputDir, "katana.txt")}, "")
+	// 8. Crawling (Katana) — in-scope, live hosts only
+	runCommand("katana", []string{"-u", liveFile, "-o", katanaFile}, "")
 
-	// 7. JS Extraction
-	extractJS(filepath.Join(outputDir, "katana.txt"), filepath.Join(outputDir, "jsfiles.txt"))
+	// 9. JS Extraction
+	extractJS(katanaFile, jsFile)
 
-	// 8. Secret Analysis
-	runSecretFinder(filepath.Join(outputDir, "jsfiles.txt"))
+	// 10. Secret Analysis
+	runSecretFinder(jsFile)
 
 	fmt.Println()
 	color.HiGreen("[!!!] All Recon Tasks Completed Successfully! [!!!]")
